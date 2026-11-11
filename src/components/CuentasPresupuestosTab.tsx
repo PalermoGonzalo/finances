@@ -84,7 +84,7 @@ export const CuentasPresupuestosTab: React.FC<CuentasPresupuestosTabProps> = ({
     if (!wNombre.trim()) return;
     const saldoIni = Number(wSaldoInicial.replace(',', '.')) || 0;
     onAddCuenta({
-      id: `cuenta-${Date.now()}`,
+      id: crypto.randomUUID(),
       nombre: wNombre.trim(),
       tipo: wTipo,
       institucion: wInstitucion.trim() || wNombre.trim(),
@@ -105,7 +105,7 @@ export const CuentasPresupuestosTab: React.FC<CuentasPresupuestosTabProps> = ({
     const lim = Number(bLimite.replace(',', '.')) || 0;
     if (lim <= 0) return;
     onAddPresupuesto({
-      id: `pres-${Date.now()}`,
+      id: crypto.randomUUID(),
       categoria_id: bCatId,
       mes: selectedMonth,
       anio: selectedYear,

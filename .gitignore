@@ -8,3 +8,6 @@ dist-ssr
 .wrangler
 *.tsbuildinfo
 .codebase-memory
+*.xlsx
+src/data/excel_seed.json
+supabase/migration_etl_excel.sql

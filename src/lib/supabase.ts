@@ -115,21 +115,24 @@ export function getSupabaseClient(): FinanzasSupabaseClient | null {
 
 export const isSupabaseConfigured = Boolean(getSupabaseConfig());
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function ensureValidUuid(id: string): string {
+  if (UUID_REGEX.test(id)) return id;
+  return crypto.randomUUID();
+}
+
 /**
- * Descarga todos los registros del esquema `finanzas` en Supabase.
+ * Descarga todos los registros del esquema `finanzas` en Supabase para el usuario autenticado.
  * Utiliza paginación automática para superar el límite por defecto de 1.000 filas de PostgREST
  * en las 3.916+ transacciones históricas.
  */
 export async function fetchDatabaseFromSupabase(
   client: FinanzasSupabaseClient
 ): Promise<Partial<AppDatabase> | null> {
-  // Intentar reclamar datos históricos si el usuario está autenticado
   const { data: sessionData } = await client.auth.getSession();
-  if (sessionData.session?.user) {
-    await client.rpc('fn_reclamar_datos_historicos').then(
-      () => undefined,
-      () => undefined
-    );
+  if (!sessionData.session?.user) {
+    return null;
   }
 
   const [cuentasRes, categoriasRes, prestamosRes, cuotasRes, gruposRes, miembrosRes, gastosCompRes, pagadoresRes, divisionesRes, liqRes] =
@@ -362,14 +365,17 @@ export async function syncDatabaseToSupabase(
   onProgress?: (msg: string) => void
 ): Promise<void> {
   const { data: sessionData } = await client.auth.getSession();
-  const uid = sessionData.session?.user?.id ?? null;
+  const uid = sessionData.session?.user?.id;
+  if (!uid) {
+    throw new Error('Debés iniciar sesión con tu cuenta en Supabase Auth antes de sincronizar datos.');
+  }
 
   onProgress?.('Sincronizando categorías y billeteras...');
   if (db.categorias.length > 0) {
     const { error } = await client.from('categorias').upsert(
       db.categorias.map((c) => ({
-        id: c.id,
-        user_id: null,
+        id: ensureValidUuid(c.id),
+        user_id: uid,
         nombre: c.nombre,
         tipo: c.tipo,
         icono: c.icono,

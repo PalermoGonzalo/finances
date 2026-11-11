@@ -1,13 +1,13 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   CheckCircle2,
   Cloud,
   Database,
+  FileJson,
   KeyRound,
   LogIn,
   LogOut,
   RefreshCw,
-  RotateCcw,
   ShieldCheck,
   UploadCloud,
   X,
@@ -20,6 +20,7 @@ import {
   saveSupabaseConfigLocal,
   syncDatabaseToSupabase,
 } from '../lib/supabase';
+import { parseDatabaseFromSeedJson } from '../lib/storage';
 import { AppDatabase } from '../types';
 
 interface SupabaseModalProps {
@@ -27,7 +28,7 @@ interface SupabaseModalProps {
   onClose: () => void;
   db: AppDatabase;
   onReplaceDatabase: (newDb: Partial<AppDatabase>) => void;
-  onResetToSeed: () => void;
+  onSignOutPurge: () => void;
 }
 
 export const SupabaseModal: React.FC<SupabaseModalProps> = ({
@@ -35,7 +36,7 @@ export const SupabaseModal: React.FC<SupabaseModalProps> = ({
   onClose,
   db,
   onReplaceDatabase,
-  onResetToSeed,
+  onSignOutPurge,
 }) => {
   const existingCfg = getSupabaseConfig();
   const [url, setUrl] = useState(existingCfg?.url ?? '');
@@ -49,6 +50,8 @@ export const SupabaseModal: React.FC<SupabaseModalProps> = ({
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [isBusy, setIsBusy] = useState(false);
+
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -106,9 +109,10 @@ export const SupabaseModal: React.FC<SupabaseModalProps> = ({
     const client = getSupabaseClient();
     if (client) {
       await client.auth.signOut();
-      setUserEmail(null);
-      setStatusMsg('Sesión cerrada.');
     }
+    setUserEmail(null);
+    onSignOutPurge();
+    setStatusMsg('Sesión cerrada y caché local limpiado por seguridad.');
   };
 
   const handlePushToSupabase = async () => {
@@ -123,13 +127,13 @@ export const SupabaseModal: React.FC<SupabaseModalProps> = ({
     try {
       await syncDatabaseToSupabase(client, db, (msg) => setStatusMsg(msg));
       setStatusMsg(
-        '¡Sincronización completa! Todos los registros de Ingresos, Gastos Disc., Hipotecario (240 cuotas) y Splitwise fueron guardados en el esquema finanzas.'
+        '¡Sincronización completa! Todos tus registros fueron guardados de forma privada en el esquema finanzas bajo tu usuario autenticado.'
       );
     } catch (err: unknown) {
       setErrorMsg(
         err instanceof Error
           ? err.message
-          : 'Error al subir datos. Verificá haber corrido supabase/schema.sql y expuesto el esquema finanzas en Data API.'
+          : 'Error al subir datos. Verificá haber iniciado sesión y corrido supabase/security_hardening.sql.'
       );
     } finally {
       setIsBusy(false);
@@ -146,10 +150,12 @@ export const SupabaseModal: React.FC<SupabaseModalProps> = ({
     }
     setIsBusy(true);
     try {
-      setStatusMsg('Descargando datos desde el esquema finanzas...');
+      setStatusMsg('Descargando tus datos privados desde el esquema finanzas...');
       const remote = await fetchDatabaseFromSupabase(client);
       if (!remote) {
-        setStatusMsg('El esquema finanzas está vacío en Supabase. Usá "Subir Histórico Excel" primero.');
+        setStatusMsg(
+          'Aún no hay datos bajo tu usuario en el esquema finanzas. Importá tu archivo excel_seed.json local y luego tocá "Subir Todo a Supabase".'
+        );
       } else {
         onReplaceDatabase(remote);
         setStatusMsg('Datos descargados y sincronizados desde Supabase.');
@@ -161,6 +167,41 @@ export const SupabaseModal: React.FC<SupabaseModalProps> = ({
     }
   };
 
+  const handleLocalJsonSeedUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setErrorMsg(null);
+    setStatusMsg(null);
+    setIsBusy(true);
+    try {
+      const text = await file.text();
+      const rawJson = JSON.parse(text) as unknown;
+      const parsedDb = parseDatabaseFromSeedJson(rawJson);
+      onReplaceDatabase(parsedDb);
+
+      const client = getSupabaseClient();
+      if (client && userEmail) {
+        await syncDatabaseToSupabase(client, parsedDb, (msg) => setStatusMsg(msg));
+        setStatusMsg(
+          `¡Semilla importada (${parsedDb.transacciones.length} movimientos) y sincronizada en Supabase bajo tu usuario (${userEmail})!`
+        );
+      } else {
+        setStatusMsg(
+          `Semilla importada en sesión (${parsedDb.transacciones.length} movimientos). Tocá "Subir Todo a Supabase" para persistirla en la nube.`
+        );
+      }
+    } catch (err: unknown) {
+      setErrorMsg(
+        err instanceof Error ? err.message : 'No se pudo leer o sincronizar el archivo JSON de semilla.'
+      );
+    } finally {
+      setIsBusy(false);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
+    }
+  };
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/85 p-4 backdrop-blur-sm">
       <div className="w-full max-w-2xl rounded-2xl border border-slate-700 bg-slate-900 p-6 shadow-2xl space-y-5 max-h-[92vh] overflow-y-auto">
@@ -169,10 +210,10 @@ export const SupabaseModal: React.FC<SupabaseModalProps> = ({
             <Database className="h-5 w-5 text-emerald-400" />
             <div>
               <h3 className="text-base font-bold text-slate-100">
-                Supabase Cloud & Auth · Esquema Aislado <code className="text-emerald-400">finanzas</code>
+                Seguridad, Auth & Sincronización · Esquema <code className="text-emerald-400">finanzas</code>
               </h3>
               <p className="text-xs text-slate-400">
-                Proyecto: gonpa-design · Aislado de <code>public</code> e <code>impresion3d</code>
+                Proyecto: gonpa-design · RLS estricto por <code>auth.uid()</code> · Cero datos en bundle público
               </p>
             </div>
           </div>
@@ -202,7 +243,7 @@ export const SupabaseModal: React.FC<SupabaseModalProps> = ({
           <div className="flex items-center justify-between">
             <h4 className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
               <ShieldCheck className="h-4 w-4 text-emerald-400" />
-              Sesión Supabase Auth (RLS Activo)
+              Sesión Supabase Auth (RLS Estricto)
             </h4>
             {userEmail && (
               <span className="rounded-full bg-emerald-500/20 px-2.5 py-0.5 text-[11px] font-semibold text-emerald-300">
@@ -214,11 +255,11 @@ export const SupabaseModal: React.FC<SupabaseModalProps> = ({
           {userEmail ? (
             <div className="flex items-center justify-between pt-1">
               <span className="text-xs text-slate-400">
-                Tus políticas RLS vinculan los datos a tu usuario autenticado.
+                Tus datos están protegidos por RLS exclusivamente bajo tu UID. Al cerrar sesión se purga el almacenamiento local.
               </span>
               <button
                 onClick={handleSignOut}
-                className="inline-flex items-center gap-1.5 rounded-xl bg-slate-800 px-3 py-1.5 text-xs font-semibold text-rose-300 hover:bg-slate-700"
+                className="inline-flex items-center gap-1.5 rounded-xl bg-slate-800 px-3 py-1.5 text-xs font-semibold text-rose-300 hover:bg-slate-700 shrink-0 ml-3"
               >
                 <LogOut className="h-3.5 w-3.5" />
                 Cerrar Sesión
@@ -259,44 +300,48 @@ export const SupabaseModal: React.FC<SupabaseModalProps> = ({
           <button
             type="button"
             disabled={isBusy}
-            onClick={handlePushToSupabase}
-            className="flex flex-col items-start justify-between rounded-xl border border-emerald-500/30 bg-emerald-950/20 p-3.5 text-left hover:bg-emerald-950/40 transition disabled:opacity-50"
-          >
-            <UploadCloud className="h-5 w-5 text-emerald-400 mb-2" />
-            <div className="text-xs font-bold text-slate-100">Subir Todo a Supabase</div>
-            <div className="text-[11px] text-slate-400 mt-0.5">
-              Sincroniza las 3.916 transacciones, 240 cuotas UVA y Splitwise al esquema finanzas.
-            </div>
-          </button>
-
-          <button
-            type="button"
-            disabled={isBusy}
             onClick={handlePullFromSupabase}
             className="flex flex-col items-start justify-between rounded-xl border border-indigo-500/30 bg-indigo-950/20 p-3.5 text-left hover:bg-indigo-950/40 transition disabled:opacity-50"
           >
             <RefreshCw className="h-5 w-5 text-indigo-400 mb-2" />
             <div className="text-xs font-bold text-slate-100">Descargar de Supabase</div>
             <div className="text-[11px] text-slate-400 mt-0.5">
-              Trae el estado más reciente desde las tablas del esquema finanzas.
+              Trae tus cuentas, movimientos, cuotas UVA y Splitwise desde la nube.
             </div>
           </button>
 
           <button
             type="button"
             disabled={isBusy}
-            onClick={() => {
-              onResetToSeed();
-              setStatusMsg('Base local restaurada a la semilla original del Excel.');
-            }}
-            className="flex flex-col items-start justify-between rounded-xl border border-slate-700 bg-slate-800/40 p-3.5 text-left hover:bg-slate-800 transition"
+            onClick={handlePushToSupabase}
+            className="flex flex-col items-start justify-between rounded-xl border border-emerald-500/30 bg-emerald-950/20 p-3.5 text-left hover:bg-emerald-950/40 transition disabled:opacity-50"
           >
-            <RotateCcw className="h-5 w-5 text-amber-400 mb-2" />
-            <div className="text-xs font-bold text-slate-100">Restaurar Semilla Excel</div>
+            <UploadCloud className="h-5 w-5 text-emerald-400 mb-2" />
+            <div className="text-xs font-bold text-slate-100">Subir Todo a Supabase</div>
             <div className="text-[11px] text-slate-400 mt-0.5">
-              Recarga los datos originales de Ingresos, Gastos Disc. e Hipotecario.
+              Guarda el estado actual en el esquema finanzas vinculado a tu usuario.
             </div>
           </button>
+
+          <button
+            type="button"
+            disabled={isBusy}
+            onClick={() => fileInputRef.current?.click()}
+            className="flex flex-col items-start justify-between rounded-xl border border-amber-500/30 bg-amber-950/20 p-3.5 text-left hover:bg-amber-950/40 transition disabled:opacity-50"
+          >
+            <FileJson className="h-5 w-5 text-amber-400 mb-2" />
+            <div className="text-xs font-bold text-slate-100">Importar Seed JSON Local</div>
+            <div className="text-[11px] text-slate-400 mt-0.5">
+              Cargá desde tu PC el archivo <code>excel_seed.json</code> sin exponerlo en el bundle web.
+            </div>
+          </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".json,application/json"
+            onChange={handleLocalJsonSeedUpload}
+            className="hidden"
+          />
         </div>
 
         {/* Bloque 3: Configuración Manual de Credenciales */}

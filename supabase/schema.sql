@@ -14,8 +14,9 @@
 -- 1. Crear el esquema aislado
 CREATE SCHEMA IF NOT EXISTS finanzas;
 
--- 2. Permisos de esquema para PostgREST (anon, authenticated, service_role)
-GRANT USAGE ON SCHEMA finanzas TO anon, authenticated, service_role;
+-- 2. Permisos de esquema para PostgREST (SOLO authenticated y service_role; CERO acceso para anon)
+REVOKE ALL ON SCHEMA finanzas FROM anon;
+GRANT USAGE ON SCHEMA finanzas TO authenticated, service_role;
 GRANT ALL ON SCHEMA finanzas TO postgres, service_role;
 
 -- =============================================================================
@@ -691,9 +692,10 @@ AFTER INSERT OR UPDATE OR DELETE ON finanzas.liquidaciones
 FOR EACH ROW EXECUTE FUNCTION finanzas.trg_sincronizar_liquidacion();
 
 -- =============================================================================
--- VISTA DE SALDOS SPLITWISE POR GRUPO, MIEMBRO Y MONEDA
+-- VISTA DE SALDOS SPLITWISE POR GRUPO, MIEMBRO Y MONEDA (CON SECURITY INVOKER)
 -- =============================================================================
-CREATE OR REPLACE VIEW finanzas.v_saldos_grupos AS
+CREATE OR REPLACE VIEW finanzas.v_saldos_grupos
+WITH (security_invoker = true) AS
 WITH pagos AS (
   SELECT
     gc.grupo_id,
@@ -785,7 +787,7 @@ LEFT JOIN liq_recibidas lr
   AND lr.moneda = mm.moneda;
 
 -- =============================================================================
--- FUNCIÓN AUXILIAR RLS: VERIFICAR ACCESO A UN GRUPO COMPARTIDO
+-- FUNCIONES AUXILIARES RLS: VERIFICAR ACCESO A GRUPOS Y GASTOS COMPARTIDOS
 -- =============================================================================
 CREATE OR REPLACE FUNCTION finanzas.fn_usuario_pertenece_a_grupo(p_grupo_id uuid)
 RETURNS boolean
@@ -794,13 +796,36 @@ SECURITY DEFINER
 STABLE
 SET search_path = finanzas, public
 AS $$
-  SELECT EXISTS (
-    SELECT 1 FROM finanzas.grupos g
-    WHERE g.id = p_grupo_id AND g.creado_por = auth.uid()
-  ) OR EXISTS (
-    SELECT 1 FROM finanzas.grupos_miembros gm
-    WHERE gm.grupo_id = p_grupo_id AND gm.user_id = auth.uid()
-  );
+  SELECT CASE
+    WHEN auth.uid() IS NULL OR p_grupo_id IS NULL THEN false
+    ELSE EXISTS (
+      SELECT 1 FROM finanzas.grupos g
+      WHERE g.id = p_grupo_id AND g.creado_por = auth.uid()
+    ) OR EXISTS (
+      SELECT 1 FROM finanzas.grupos_miembros gm
+      WHERE gm.grupo_id = p_grupo_id AND gm.user_id = auth.uid()
+    )
+  END;
+$$;
+
+CREATE OR REPLACE FUNCTION finanzas.fn_usuario_accede_gasto_compartido(p_gasto_id uuid)
+RETURNS boolean
+LANGUAGE sql
+SECURITY DEFINER
+STABLE
+SET search_path = finanzas, public
+AS $$
+  SELECT CASE
+    WHEN auth.uid() IS NULL OR p_gasto_id IS NULL THEN false
+    ELSE EXISTS (
+      SELECT 1 FROM finanzas.gastos_compartidos gc
+      WHERE gc.id = p_gasto_id
+        AND (
+          gc.creado_por = auth.uid()
+          OR (gc.grupo_id IS NOT NULL AND finanzas.fn_usuario_pertenece_a_grupo(gc.grupo_id))
+        )
+    )
+  END;
 $$;
 
 -- =============================================================================
@@ -825,7 +850,7 @@ ALTER TABLE finanzas.prestamos_cuotas ENABLE ROW LEVEL SECURITY;
 
 -- Políticas: usuarios_perfiles
 DROP POLICY IF EXISTS "perfiles_select" ON finanzas.usuarios_perfiles;
-CREATE POLICY "perfiles_select" ON finanzas.usuarios_perfiles FOR SELECT TO authenticated USING (true);
+CREATE POLICY "perfiles_select" ON finanzas.usuarios_perfiles FOR SELECT TO authenticated USING (id = auth.uid());
 DROP POLICY IF EXISTS "perfiles_insert" ON finanzas.usuarios_perfiles;
 CREATE POLICY "perfiles_insert" ON finanzas.usuarios_perfiles FOR INSERT TO authenticated WITH CHECK (id = auth.uid());
 DROP POLICY IF EXISTS "perfiles_update" ON finanzas.usuarios_perfiles;
@@ -835,142 +860,120 @@ CREATE POLICY "perfiles_update" ON finanzas.usuarios_perfiles FOR UPDATE TO auth
 DROP POLICY IF EXISTS "cotizaciones_select" ON finanzas.cotizaciones;
 CREATE POLICY "cotizaciones_select" ON finanzas.cotizaciones FOR SELECT TO authenticated USING (user_id IS NULL OR user_id = auth.uid());
 DROP POLICY IF EXISTS "cotizaciones_write" ON finanzas.cotizaciones;
-CREATE POLICY "cotizaciones_write" ON finanzas.cotizaciones FOR ALL TO authenticated USING (user_id IS NULL OR user_id = auth.uid()) WITH CHECK (user_id IS NULL OR user_id = auth.uid());
+CREATE POLICY "cotizaciones_write" ON finanzas.cotizaciones FOR ALL TO authenticated USING (user_id = auth.uid()) WITH CHECK (user_id = auth.uid());
 
--- Políticas: cuentas
+-- Políticas: cuentas (estrictamente privadas por usuario)
 DROP POLICY IF EXISTS "cuentas_owner" ON finanzas.cuentas;
 CREATE POLICY "cuentas_owner" ON finanzas.cuentas FOR ALL TO authenticated
-  USING (user_id IS NULL OR user_id = auth.uid())
-  WITH CHECK (user_id IS NULL OR user_id = auth.uid());
+  USING (user_id = auth.uid())
+  WITH CHECK (user_id = auth.uid());
 
--- Políticas: categorias y subcategorias (globales user_id IS NULL + propias del usuario)
+-- Políticas: categorias y subcategorias (globales user_id IS NULL solo lectura + propias del usuario)
 DROP POLICY IF EXISTS "categorias_select" ON finanzas.categorias;
 CREATE POLICY "categorias_select" ON finanzas.categorias FOR SELECT TO authenticated USING (user_id IS NULL OR user_id = auth.uid());
 DROP POLICY IF EXISTS "categorias_write" ON finanzas.categorias;
-CREATE POLICY "categorias_write" ON finanzas.categorias FOR ALL TO authenticated USING (user_id IS NULL OR user_id = auth.uid()) WITH CHECK (user_id IS NULL OR user_id = auth.uid());
+CREATE POLICY "categorias_write" ON finanzas.categorias FOR ALL TO authenticated USING (user_id = auth.uid()) WITH CHECK (user_id = auth.uid());
 
 DROP POLICY IF EXISTS "subcategorias_select" ON finanzas.subcategorias;
 CREATE POLICY "subcategorias_select" ON finanzas.subcategorias FOR SELECT TO authenticated USING (user_id IS NULL OR user_id = auth.uid());
 DROP POLICY IF EXISTS "subcategorias_write" ON finanzas.subcategorias;
-CREATE POLICY "subcategorias_write" ON finanzas.subcategorias FOR ALL TO authenticated USING (user_id IS NULL OR user_id = auth.uid()) WITH CHECK (user_id IS NULL OR user_id = auth.uid());
+CREATE POLICY "subcategorias_write" ON finanzas.subcategorias FOR ALL TO authenticated USING (user_id = auth.uid()) WITH CHECK (user_id = auth.uid());
 
 -- Políticas: contactos
 DROP POLICY IF EXISTS "contactos_access" ON finanzas.contactos;
 CREATE POLICY "contactos_access" ON finanzas.contactos FOR ALL TO authenticated
-  USING (owner_user_id IS NULL OR owner_user_id = auth.uid() OR linked_user_id = auth.uid())
-  WITH CHECK (owner_user_id IS NULL OR owner_user_id = auth.uid());
+  USING (owner_user_id = auth.uid() OR linked_user_id = auth.uid())
+  WITH CHECK (owner_user_id = auth.uid());
 
 -- Políticas: grupos y grupos_miembros
 DROP POLICY IF EXISTS "grupos_select" ON finanzas.grupos;
 CREATE POLICY "grupos_select" ON finanzas.grupos FOR SELECT TO authenticated
-  USING (creado_por IS NULL OR creado_por = auth.uid() OR finanzas.fn_usuario_pertenece_a_grupo(id));
+  USING (creado_por = auth.uid() OR finanzas.fn_usuario_pertenece_a_grupo(id));
 DROP POLICY IF EXISTS "grupos_insert" ON finanzas.grupos;
-CREATE POLICY "grupos_insert" ON finanzas.grupos FOR INSERT TO authenticated WITH CHECK (creado_por IS NULL OR creado_por = auth.uid());
+CREATE POLICY "grupos_insert" ON finanzas.grupos FOR INSERT TO authenticated WITH CHECK (creado_por = auth.uid());
 DROP POLICY IF EXISTS "grupos_update" ON finanzas.grupos;
 CREATE POLICY "grupos_update" ON finanzas.grupos FOR UPDATE TO authenticated
-  USING (creado_por IS NULL OR creado_por = auth.uid() OR finanzas.fn_usuario_pertenece_a_grupo(id));
+  USING (creado_por = auth.uid() OR finanzas.fn_usuario_pertenece_a_grupo(id))
+  WITH CHECK (creado_por = auth.uid() OR finanzas.fn_usuario_pertenece_a_grupo(id));
 DROP POLICY IF EXISTS "grupos_delete" ON finanzas.grupos;
-CREATE POLICY "grupos_delete" ON finanzas.grupos FOR DELETE TO authenticated USING (creado_por IS NULL OR creado_por = auth.uid());
+CREATE POLICY "grupos_delete" ON finanzas.grupos FOR DELETE TO authenticated USING (creado_por = auth.uid());
 
 DROP POLICY IF EXISTS "grupos_miembros_access" ON finanzas.grupos_miembros;
 CREATE POLICY "grupos_miembros_access" ON finanzas.grupos_miembros FOR ALL TO authenticated
-  USING (user_id IS NULL OR user_id = auth.uid() OR finanzas.fn_usuario_pertenece_a_grupo(grupo_id))
-  WITH CHECK (true);
+  USING (user_id = auth.uid() OR finanzas.fn_usuario_pertenece_a_grupo(grupo_id))
+  WITH CHECK (finanzas.fn_usuario_pertenece_a_grupo(grupo_id));
 
 -- Políticas: gastos_compartidos, pagadores, divisiones, liquidaciones
 DROP POLICY IF EXISTS "gastos_compartidos_access" ON finanzas.gastos_compartidos;
 CREATE POLICY "gastos_compartidos_access" ON finanzas.gastos_compartidos FOR ALL TO authenticated
-  USING (creado_por IS NULL OR creado_por = auth.uid() OR (grupo_id IS NOT NULL AND finanzas.fn_usuario_pertenece_a_grupo(grupo_id)))
-  WITH CHECK (creado_por IS NULL OR creado_por = auth.uid() OR (grupo_id IS NOT NULL AND finanzas.fn_usuario_pertenece_a_grupo(grupo_id)));
+  USING (creado_por = auth.uid() OR (grupo_id IS NOT NULL AND finanzas.fn_usuario_pertenece_a_grupo(grupo_id)))
+  WITH CHECK (creado_por = auth.uid() OR (grupo_id IS NOT NULL AND finanzas.fn_usuario_pertenece_a_grupo(grupo_id)));
 
 DROP POLICY IF EXISTS "gastos_pagadores_access" ON finanzas.gastos_pagadores;
 CREATE POLICY "gastos_pagadores_access" ON finanzas.gastos_pagadores FOR ALL TO authenticated
-  USING (true)
-  WITH CHECK (true);
+  USING (finanzas.fn_usuario_accede_gasto_compartido(gasto_compartido_id))
+  WITH CHECK (finanzas.fn_usuario_accede_gasto_compartido(gasto_compartido_id));
 
 DROP POLICY IF EXISTS "divisiones_gasto_access" ON finanzas.divisiones_gasto;
 CREATE POLICY "divisiones_gasto_access" ON finanzas.divisiones_gasto FOR ALL TO authenticated
-  USING (true)
-  WITH CHECK (true);
+  USING (finanzas.fn_usuario_accede_gasto_compartido(gasto_compartido_id))
+  WITH CHECK (finanzas.fn_usuario_accede_gasto_compartido(gasto_compartido_id));
 
 DROP POLICY IF EXISTS "liquidaciones_access" ON finanzas.liquidaciones;
 CREATE POLICY "liquidaciones_access" ON finanzas.liquidaciones FOR ALL TO authenticated
   USING (
-    creado_por IS NULL
-    OR creado_por = auth.uid()
+    creado_por = auth.uid()
     OR deudor_user_id = auth.uid()
     OR acreedor_user_id = auth.uid()
     OR (grupo_id IS NOT NULL AND finanzas.fn_usuario_pertenece_a_grupo(grupo_id))
   )
   WITH CHECK (
-    creado_por IS NULL
-    OR creado_por = auth.uid()
+    creado_por = auth.uid()
     OR (grupo_id IS NOT NULL AND finanzas.fn_usuario_pertenece_a_grupo(grupo_id))
   );
 
--- Políticas: transacciones, presupuestos, prestamos
+-- Políticas: transacciones, presupuestos, prestamos (estrictamente privadas por usuario)
 DROP POLICY IF EXISTS "transacciones_owner" ON finanzas.transacciones;
 CREATE POLICY "transacciones_owner" ON finanzas.transacciones FOR ALL TO authenticated
-  USING (user_id IS NULL OR user_id = auth.uid())
-  WITH CHECK (user_id IS NULL OR user_id = auth.uid());
+  USING (user_id = auth.uid())
+  WITH CHECK (user_id = auth.uid());
 
 DROP POLICY IF EXISTS "presupuestos_owner" ON finanzas.presupuestos;
 CREATE POLICY "presupuestos_owner" ON finanzas.presupuestos FOR ALL TO authenticated
-  USING (user_id IS NULL OR user_id = auth.uid())
-  WITH CHECK (user_id IS NULL OR user_id = auth.uid());
+  USING (user_id = auth.uid())
+  WITH CHECK (user_id = auth.uid());
 
 DROP POLICY IF EXISTS "prestamos_owner" ON finanzas.prestamos_creditos;
 CREATE POLICY "prestamos_owner" ON finanzas.prestamos_creditos FOR ALL TO authenticated
-  USING (user_id IS NULL OR user_id = auth.uid())
-  WITH CHECK (user_id IS NULL OR user_id = auth.uid());
+  USING (user_id = auth.uid())
+  WITH CHECK (user_id = auth.uid());
 
 DROP POLICY IF EXISTS "prestamos_cuotas_owner" ON finanzas.prestamos_cuotas;
 CREATE POLICY "prestamos_cuotas_owner" ON finanzas.prestamos_cuotas FOR ALL TO authenticated
-  USING (user_id IS NULL OR user_id = auth.uid())
-  WITH CHECK (user_id IS NULL OR user_id = auth.uid());
-
--- Función RPC para reclamar automáticamente registros históricos con user_id IS NULL al iniciar sesión
-CREATE OR REPLACE FUNCTION finanzas.fn_reclamar_datos_historicos()
-RETURNS void
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = finanzas, public
-AS $$
-DECLARE
-  v_uid uuid := auth.uid();
-BEGIN
-  IF v_uid IS NULL THEN
-    RETURN;
-  END IF;
-
-  UPDATE finanzas.cuentas SET user_id = v_uid WHERE user_id IS NULL;
-  UPDATE finanzas.transacciones SET user_id = v_uid WHERE user_id IS NULL;
-  UPDATE finanzas.presupuestos SET user_id = v_uid WHERE user_id IS NULL;
-  UPDATE finanzas.prestamos_creditos SET user_id = v_uid WHERE user_id IS NULL;
-  UPDATE finanzas.prestamos_cuotas SET user_id = v_uid WHERE user_id IS NULL;
-  UPDATE finanzas.contactos SET owner_user_id = v_uid WHERE owner_user_id IS NULL;
-  UPDATE finanzas.grupos SET creado_por = v_uid WHERE creado_por IS NULL;
-  UPDATE finanzas.gastos_compartidos SET creado_por = v_uid WHERE creado_por IS NULL;
-  UPDATE finanzas.liquidaciones SET creado_por = v_uid WHERE creado_por IS NULL;
-END;
-$$;
+  USING (user_id = auth.uid())
+  WITH CHECK (user_id = auth.uid());
 
 -- =============================================================================
 -- PERMISOS EXPLÍCITOS DE TABLAS, VISTAS, SECUENCIAS Y FUNCIONES (GRANTs)
 -- =============================================================================
+REVOKE ALL ON ALL TABLES IN SCHEMA finanzas FROM anon;
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA finanzas FROM anon;
+REVOKE ALL ON ALL FUNCTIONS IN SCHEMA finanzas FROM PUBLIC, anon;
+
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA finanzas TO authenticated, service_role;
-GRANT SELECT ON ALL TABLES IN SCHEMA finanzas TO anon;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA finanzas TO anon, authenticated, service_role;
-GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA finanzas TO anon, authenticated, service_role;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA finanzas TO authenticated, service_role;
+GRANT EXECUTE ON FUNCTION finanzas.fn_usuario_pertenece_a_grupo(uuid) TO authenticated, service_role;
+GRANT EXECUTE ON FUNCTION finanzas.fn_usuario_accede_gasto_compartido(uuid) TO authenticated, service_role;
+GRANT EXECUTE ON FUNCTION finanzas.fn_sincronizar_gasto_compartido(uuid) TO authenticated, service_role;
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA finanzas REVOKE ALL ON TABLES FROM anon;
+ALTER DEFAULT PRIVILEGES IN SCHEMA finanzas REVOKE ALL ON SEQUENCES FROM anon;
+ALTER DEFAULT PRIVILEGES IN SCHEMA finanzas REVOKE ALL ON FUNCTIONS FROM PUBLIC, anon;
 
 ALTER DEFAULT PRIVILEGES IN SCHEMA finanzas
   GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO authenticated, service_role;
 ALTER DEFAULT PRIVILEGES IN SCHEMA finanzas
-  GRANT SELECT ON TABLES TO anon;
-ALTER DEFAULT PRIVILEGES IN SCHEMA finanzas
-  GRANT USAGE, SELECT ON SEQUENCES TO anon, authenticated, service_role;
-ALTER DEFAULT PRIVILEGES IN SCHEMA finanzas
-  GRANT EXECUTE ON FUNCTIONS TO anon, authenticated, service_role;
+  GRANT USAGE, SELECT ON SEQUENCES TO authenticated, service_role;
 
 -- =============================================================================
 -- SEED INICIAL: CATEGORÍAS Y SUBCATEGORÍAS DEL EXCEL + COTIZACIONES BASE

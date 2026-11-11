@@ -189,7 +189,7 @@ export const SplitwiseTab: React.FC<SplitwiseTabProps> = ({
       null;
 
     const nuevoGasto: GastoCompartido = {
-      id: `gasto-split-${Date.now()}`,
+      id: crypto.randomUUID(),
       grupo_id: grupoActual.id,
       descripcion: expDesc.trim(),
       monto_total: total,
@@ -201,7 +201,7 @@ export const SplitwiseTab: React.FC<SplitwiseTabProps> = ({
       origen_migracion: 'Splitwise Web',
       pagadores: [
         {
-          id: `pag-${Date.now()}`,
+          id: crypto.randomUUID(),
           miembro_id: pagador.id,
           nombre_pagador: pagador.nombre_display,
           monto_pagado: total,
@@ -244,7 +244,7 @@ export const SplitwiseTab: React.FC<SplitwiseTabProps> = ({
     if (!deudor || !acreedor || deudor.id === acreedor.id) return;
 
     const liq: LiquidacionSplitwise = {
-      id: `liq-${Date.now()}`,
+      id: crypto.randomUUID(),
       grupo_id: grupoActual.id,
       deudor_miembro_id: deudor.id,
       deudor_nombre: deudor.nombre_display,
@@ -265,7 +265,7 @@ export const SplitwiseTab: React.FC<SplitwiseTabProps> = ({
   const handleCreateGroup = (e: React.FormEvent) => {
     e.preventDefault();
     if (!newGroupName.trim()) return;
-    const gid = `grupo-${Date.now()}`;
+    const gid = crypto.randomUUID();
     const nombres = newGroupMembersStr
       .split(',')
       .map((s) => s.trim())
@@ -274,7 +274,7 @@ export const SplitwiseTab: React.FC<SplitwiseTabProps> = ({
 
     const pct = Number((100 / nombres.length).toFixed(2));
     const miembros = nombres.map((n, idx) => ({
-      id: `miembro-${gid}-${idx}`,
+      id: crypto.randomUUID(),
       grupo_id: gid,
       nombre_display: n,
       rol: (idx === 0 ? 'admin' : 'miembro') as 'admin' | 'miembro',

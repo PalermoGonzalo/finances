@@ -2,8 +2,13 @@ import React, { useEffect, useState } from 'react';
 import {
   Building2,
   Cloud,
+  KeyRound,
   LayoutDashboard,
   ListOrdered,
+  Lock,
+  LogIn,
+  LogOut,
+  ShieldCheck,
   Table,
   TrendingUp,
   Users,
@@ -19,12 +24,18 @@ import {
   Transaccion,
 } from './types';
 import {
+  buildEmptyDatabase,
+  clearLocalDatabaseCache,
   loadDatabaseFromLocal,
   recalculateAndNormalizeDatabase,
-  resetDatabaseToExcelSeed,
   saveDatabaseToLocal,
 } from './lib/storage';
-import { fetchDatabaseFromSupabase, getSupabaseClient, getSupabaseConfig } from './lib/supabase';
+import {
+  fetchDatabaseFromSupabase,
+  getSupabaseClient,
+  getSupabaseConfig,
+  saveSupabaseConfigLocal,
+} from './lib/supabase';
 import { DashboardTab } from './components/DashboardTab';
 import { MatrizGastosDiscTab } from './components/MatrizGastosDiscTab';
 import { TransaccionesTab } from './components/TransaccionesTab';
@@ -41,45 +52,163 @@ type ActiveTab =
   | 'splitwise'
   | 'cuentas';
 
+interface SessionUserInfo {
+  id: string;
+  email: string;
+}
+
 export function App() {
-  const [db, setDb] = useState<AppDatabase>(() => loadDatabaseFromLocal());
+  const [db, setDb] = useState<AppDatabase>(() => buildEmptyDatabase());
   const [activeTab, setActiveTab] = useState<ActiveTab>('dashboard');
   const [selectedYear, setSelectedYear] = useState<number>(2025);
   const [showSupabaseModal, setShowSupabaseModal] = useState<boolean>(false);
   const [cloudConnected, setCloudConnected] = useState<boolean>(() => Boolean(getSupabaseConfig()));
 
-  // Intentar hidratar desde Supabase (esquema finanzas) al iniciar si está configurado
+  // Estado de autenticación obligatoria (Auth Gate)
+  const [authChecking, setAuthChecking] = useState<boolean>(true);
+  const [sessionUser, setSessionUser] = useState<SessionUserInfo | null>(null);
+  const [loginEmail, setLoginEmail] = useState<string>('');
+  const [loginPassword, setLoginPassword] = useState<string>('');
+  const [loginError, setLoginError] = useState<string | null>(null);
+  const [loginBusy, setLoginBusy] = useState<boolean>(false);
+
+  // Configuración manual si aún no se inyectaron variables de entorno en local
+  const [showManualConfig, setShowManualConfig] = useState<boolean>(() => !getSupabaseConfig());
+  const [cfgUrl, setCfgUrl] = useState<string>(() => getSupabaseConfig()?.url ?? '');
+  const [cfgAnonKey, setCfgAnonKey] = useState<string>(() => getSupabaseConfig()?.anonKey ?? '');
+  const [cfgSchema, setCfgSchema] = useState<string>(() => getSupabaseConfig()?.schema ?? 'finanzas');
+
+  // Hidratar datos desde Supabase únicamente cuando existe una sesión autenticada válida
+  const hydrateAuthenticatedData = async (uid: string) => {
+    const client = getSupabaseClient();
+    if (!client || !uid) return;
+    const localCached = loadDatabaseFromLocal();
+    setDb(localCached);
+
+    try {
+      const remote = await fetchDatabaseFromSupabase(client);
+      if (remote && ((remote.transacciones?.length ?? 0) > 0 || (remote.cuentas?.length ?? 0) > 0)) {
+        setDb((prev) => {
+          const merged = recalculateAndNormalizeDatabase({
+            ...prev,
+            ...remote,
+            prestamoHipotecario: remote.prestamoHipotecario ?? prev.prestamoHipotecario,
+            gruposSplitwise:
+              remote.gruposSplitwise && remote.gruposSplitwise.length > 0
+                ? remote.gruposSplitwise
+                : prev.gruposSplitwise,
+          });
+          saveDatabaseToLocal(merged);
+          return merged;
+        });
+      }
+    } catch {
+      // Mantiene datos cacheados de la sesión autenticada si hay corte de red temporal
+    }
+  };
+
   useEffect(() => {
     const client = getSupabaseClient();
-    if (!client) return;
+    if (!client) {
+      setAuthChecking(false);
+      return;
+    }
     setCloudConnected(true);
-    fetchDatabaseFromSupabase(client)
-      .then((remote) => {
-        if (remote && remote.transacciones && remote.transacciones.length > 0) {
-          setDb((prev) => {
-            const merged = recalculateAndNormalizeDatabase({
-              ...prev,
-              ...remote,
-              prestamoHipotecario: remote.prestamoHipotecario ?? prev.prestamoHipotecario,
-              gruposSplitwise:
-                remote.gruposSplitwise && remote.gruposSplitwise.length > 0
-                  ? remote.gruposSplitwise
-                  : prev.gruposSplitwise,
-            });
-            saveDatabaseToLocal(merged);
-            return merged;
-          });
+
+    client.auth
+      .getSession()
+      .then(({ data }) => {
+        const user = data.session?.user;
+        if (user) {
+          setSessionUser({ id: user.id, email: user.email ?? 'usuario' });
+          hydrateAuthenticatedData(user.id);
+        } else {
+          setSessionUser(null);
+          clearLocalDatabaseCache();
+          setDb(buildEmptyDatabase());
         }
       })
-      .catch(() => {
-        // Mantiene semilla local si aún no se corrió la migración en Supabase
+      .finally(() => {
+        setAuthChecking(false);
       });
-  }, []);
+
+    const { data: sub } = client.auth.onAuthStateChange((_event, session) => {
+      const user = session?.user;
+      if (user) {
+        setSessionUser({ id: user.id, email: user.email ?? 'usuario' });
+        hydrateAuthenticatedData(user.id);
+      } else {
+        setSessionUser(null);
+        setDb(clearLocalDatabaseCache());
+      }
+    });
+
+    return () => {
+      sub.subscription.unsubscribe();
+    };
+  }, [cloudConnected]);
+
+  const handleGateLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoginError(null);
+    const client = getSupabaseClient();
+    if (!client) {
+      setLoginError('Configurá primero la URL y Anon Key del proyecto Supabase.');
+      setShowManualConfig(true);
+      return;
+    }
+    setLoginBusy(true);
+    try {
+      const { data, error } = await client.auth.signInWithPassword({
+        email: loginEmail.trim(),
+        password: loginPassword,
+      });
+      if (error) throw error;
+      if (data.user) {
+        setSessionUser({ id: data.user.id, email: data.user.email ?? loginEmail.trim() });
+        setLoginPassword('');
+        await hydrateAuthenticatedData(data.user.id);
+      }
+    } catch (err: unknown) {
+      setLoginError(
+        err instanceof Error ? err.message : 'Credenciales inválidas o usuario no autorizado.'
+      );
+    } finally {
+      setLoginBusy(false);
+    }
+  };
+
+  const handleSaveGateConfig = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!cfgUrl.trim() || !cfgAnonKey.trim()) {
+      setLoginError('Completá VITE_SUPABASE_URL y VITE_SUPABASE_ANON_KEY.');
+      return;
+    }
+    saveSupabaseConfigLocal({
+      url: cfgUrl.trim(),
+      anonKey: cfgAnonKey.trim(),
+      schema: cfgSchema.trim() || 'finanzas',
+    });
+    setCloudConnected(true);
+    setShowManualConfig(false);
+    setLoginError(null);
+  };
+
+  const handleSignOut = async () => {
+    const client = getSupabaseClient();
+    if (client) {
+      await client.auth.signOut();
+    }
+    setSessionUser(null);
+    setDb(clearLocalDatabaseCache());
+  };
 
   const updateDb = (updater: (prev: AppDatabase) => AppDatabase) => {
     setDb((prev) => {
       const updated = recalculateAndNormalizeDatabase(updater(prev));
-      saveDatabaseToLocal(updated);
+      if (sessionUser) {
+        saveDatabaseToLocal(updated);
+      }
       return updated;
     });
   };
@@ -96,7 +225,6 @@ export function App() {
     const { anio, mes, seccion, rubro, monto, tipo } = params;
 
     updateDb((prev) => {
-      // Eliminar transacciones previas del mismo año, mes, sección y rubro para reemplazar con el nuevo valor
       const filtradas = prev.transacciones.filter((t) => {
         const y = t.metadatos?.anio ?? Number(t.fecha.slice(0, 4));
         const m = t.metadatos?.mes ?? Number(t.fecha.slice(5, 7));
@@ -136,7 +264,7 @@ export function App() {
         ) ?? prev.categorias[0];
 
       const nuevaTx: Transaccion = {
-        id: `cell-${anio}-${mes}-${seccion}-${rubro}-${Date.now()}`,
+        id: crypto.randomUUID(),
         cuenta_id: cuentaDefault?.id ?? null,
         cuenta_destino_id: null,
         tipo,
@@ -159,6 +287,32 @@ export function App() {
         },
       };
 
+      const client = getSupabaseClient();
+      if (client && sessionUser) {
+        client
+          .from('transacciones')
+          .upsert({
+            id: nuevaTx.id,
+            user_id: sessionUser.id,
+            cuenta_id: nuevaTx.cuenta_id,
+            cuenta_destino_id: nuevaTx.cuenta_destino_id,
+            tipo: nuevaTx.tipo,
+            concepto: nuevaTx.concepto,
+            monto: nuevaTx.monto,
+            monto_caja: nuevaTx.monto_caja,
+            moneda: nuevaTx.moneda,
+            fecha: nuevaTx.fecha,
+            categoria_id: nuevaTx.categoria_id,
+            condicion_fiscal: nuevaTx.condicion_fiscal,
+            estado_pago: nuevaTx.estado_pago,
+            es_recurrente: nuevaTx.es_recurrente,
+            observaciones: nuevaTx.observaciones,
+            origen_hoja_excel: nuevaTx.origen_hoja_excel,
+            metadatos: nuevaTx.metadatos,
+          })
+          .then(() => undefined, () => undefined);
+      }
+
       return {
         ...prev,
         transacciones: [nuevaTx, ...filtradas],
@@ -170,7 +324,7 @@ export function App() {
   const handleAddTransaction = (txData: Omit<Transaccion, 'id'>) => {
     const newTx: Transaccion = {
       ...txData,
-      id: `tx-${Date.now()}`,
+      id: crypto.randomUUID(),
     };
     updateDb((prev) => ({
       ...prev,
@@ -178,11 +332,12 @@ export function App() {
     }));
 
     const client = getSupabaseClient();
-    if (client) {
+    if (client && sessionUser) {
       client
         .from('transacciones')
         .upsert({
           id: newTx.id,
+          user_id: sessionUser.id,
           cuenta_id: newTx.cuenta_id,
           cuenta_destino_id: newTx.cuenta_destino_id,
           tipo: newTx.tipo,
@@ -209,11 +364,12 @@ export function App() {
       transacciones: prev.transacciones.filter((t) => t.id !== id),
     }));
     const client = getSupabaseClient();
-    if (client) {
+    if (client && sessionUser) {
       client
         .from('transacciones')
         .delete()
         .eq('id', id)
+        .eq('user_id', sessionUser.id)
         .then(() => undefined, () => undefined);
     }
   };
@@ -259,7 +415,6 @@ export function App() {
           prev.categorias.find((cat) => cat.nombre.includes('Hipotecario'))?.id ?? null;
         const cuentaBanco = prev.cuentas.find((cta) => cta.moneda === 'ARS')?.id ?? null;
 
-        // Reemplazar o insertar el pago del mes en Gastos Disc. -> Crédito Hipotecario
         nuevasTx = nuevasTx.filter((t) => {
           const y = t.metadatos?.anio ?? Number(t.fecha.slice(0, 4));
           const m = t.metadatos?.mes ?? Number(t.fecha.slice(5, 7));
@@ -267,7 +422,7 @@ export function App() {
         });
 
         nuevasTx.unshift({
-          id: `hip-cuota-${numeroCuota}`,
+          id: crypto.randomUUID(),
           cuenta_id: cuentaBanco,
           cuenta_destino_id: null,
           tipo: 'gasto',
@@ -306,7 +461,6 @@ export function App() {
   };
 
   // Handler 4: Splitwise (Grupos, Miembros, Gastos Compartidos y Liquidaciones)
-  // Nota: updateDb ejecuta automáticamente sincronizarSplitwiseEnTransacciones()
   const handleAddGrupo = (grupo: GrupoSplitwise) => {
     updateDb((prev) => ({
       ...prev,
@@ -324,7 +478,7 @@ export function App() {
           miembros: [
             ...g.miembros,
             {
-              id: `miembro-${Date.now()}`,
+              id: crypto.randomUUID(),
               grupo_id: grupoId,
               nombre_display: nombre,
               rol: 'miembro',
@@ -421,6 +575,164 @@ export function App() {
     }));
   };
 
+  // =========================================================================
+  // AUTH GATE OBLIGATORIO: Cero exposición de UI ni datos sin sesión activa
+  // =========================================================================
+  if (authChecking) {
+    return (
+      <div className="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center p-4">
+        <div className="flex flex-col items-center gap-3 text-center">
+          <div className="h-10 w-10 rounded-2xl bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-emerald-400 animate-pulse">
+            <ShieldCheck className="h-5 w-5" />
+          </div>
+          <p className="text-xs font-semibold text-slate-400">
+            Verificando sesión encriptada en Supabase (esquema <code>finanzas</code>)...
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!sessionUser) {
+    return (
+      <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col items-center justify-center p-4">
+        <div className="w-full max-w-md rounded-2xl border border-slate-800 bg-slate-900/90 p-6 shadow-2xl space-y-6">
+          <div className="flex items-center gap-3">
+            <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-gradient-to-br from-emerald-500 to-teal-600 text-slate-950 shadow-lg shadow-emerald-500/20">
+              <Lock className="h-5 w-5 stroke-[2.5]" />
+            </div>
+            <div>
+              <h1 className="text-base font-extrabold tracking-tight text-slate-100">
+                Finanzas & Splitwise Privado
+              </h1>
+              <p className="text-xs text-slate-400">
+                Acceso restringido · <code>finanzas.gonpa.com.ar</code>
+              </p>
+            </div>
+          </div>
+
+          <div className="rounded-xl border border-emerald-500/20 bg-emerald-950/20 p-3 text-[11px] text-emerald-300/90 flex items-start gap-2">
+            <ShieldCheck className="h-4 w-4 shrink-0 text-emerald-400 mt-0.5" />
+            <span>
+              Protegido con Row Level Security (<code>auth.uid()</code>) sobre el esquema aislado{' '}
+              <code>finanzas</code>. Ningún dato financiero se incluye en el código estático público.
+            </span>
+          </div>
+
+          {loginError && (
+            <div className="rounded-xl border border-rose-500/40 bg-rose-950/40 p-3 text-xs text-rose-300">
+              {loginError}
+            </div>
+          )}
+
+          <form onSubmit={handleGateLogin} className="space-y-3.5">
+            <div>
+              <label className="block text-xs font-semibold text-slate-300 mb-1">
+                Email de tu cuenta Supabase
+              </label>
+              <input
+                type="email"
+                required
+                autoComplete="username"
+                value={loginEmail}
+                onChange={(e) => setLoginEmail(e.target.value)}
+                placeholder="tu@email.com"
+                className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3.5 py-2.5 text-xs text-slate-100 focus:border-emerald-500 focus:outline-none"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-300 mb-1">
+                Contraseña
+              </label>
+              <input
+                type="password"
+                required
+                autoComplete="current-password"
+                value={loginPassword}
+                onChange={(e) => setLoginPassword(e.target.value)}
+                placeholder="••••••••••••"
+                className="w-full rounded-xl border border-slate-700 bg-slate-950 px-3.5 py-2.5 text-xs text-slate-100 focus:border-emerald-500 focus:outline-none"
+              />
+            </div>
+
+            <button
+              type="submit"
+              disabled={loginBusy}
+              className="w-full inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-500 px-4 py-2.5 text-xs font-bold text-slate-950 hover:bg-emerald-400 transition disabled:opacity-50"
+            >
+              <LogIn className="h-4 w-4" />
+              <span>{loginBusy ? 'Autenticando...' : 'Iniciar Sesión Segura'}</span>
+            </button>
+          </form>
+
+          {/* Configuración de entorno solo si aún no está inyectada en build */}
+          <div className="border-t border-slate-800 pt-3">
+            <button
+              type="button"
+              onClick={() => setShowManualConfig((v) => !v)}
+              className="inline-flex items-center gap-1.5 text-[11px] text-slate-400 hover:text-slate-200"
+            >
+              <KeyRound className="h-3.5 w-3.5" />
+              <span>
+                {showManualConfig
+                  ? 'Ocultar configuración de conexión Supabase'
+                  : 'Configurar URL / Anon Key de Supabase manualmente'}
+              </span>
+            </button>
+
+            {showManualConfig && (
+              <form onSubmit={handleSaveGateConfig} className="mt-3 space-y-2.5 rounded-xl border border-slate-800 bg-slate-950/60 p-3">
+                <div>
+                  <label className="block text-[11px] text-slate-400 mb-1">
+                    VITE_SUPABASE_URL
+                  </label>
+                  <input
+                    type="text"
+                    value={cfgUrl}
+                    onChange={(e) => setCfgUrl(e.target.value)}
+                    placeholder="https://xxxx.supabase.co"
+                    className="w-full rounded-lg border border-slate-700 bg-slate-900 px-2.5 py-1.5 text-xs text-slate-100"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] text-slate-400 mb-1">
+                    VITE_SUPABASE_ANON_KEY
+                  </label>
+                  <input
+                    type="password"
+                    value={cfgAnonKey}
+                    onChange={(e) => setCfgAnonKey(e.target.value)}
+                    placeholder="eyJhbGci..."
+                    className="w-full rounded-lg border border-slate-700 bg-slate-900 px-2.5 py-1.5 text-xs text-slate-100"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] text-slate-400 mb-1">
+                    VITE_SUPABASE_SCHEMA
+                  </label>
+                  <input
+                    type="text"
+                    value={cfgSchema}
+                    onChange={(e) => setCfgSchema(e.target.value)}
+                    placeholder="finanzas"
+                    className="w-full rounded-lg border border-slate-700 bg-slate-900 px-2.5 py-1.5 text-xs font-bold text-emerald-400"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  className="w-full rounded-lg bg-slate-800 border border-slate-700 py-1.5 text-xs font-semibold text-slate-200 hover:bg-slate-700"
+                >
+                  Guardar Conexión
+                </button>
+              </form>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   const navItems: { id: ActiveTab; label: string; badge?: string; icon: React.ReactNode }[] = [
     {
       id: 'dashboard',
@@ -436,7 +748,7 @@ export function App() {
     {
       id: 'hipotecario',
       label: 'Hipotecario UVA',
-      badge: '240',
+      badge: String(db.prestamoHipotecario.cuotas.length || 240),
       icon: <Building2 className="h-4 w-4" />,
     },
     {
@@ -476,11 +788,11 @@ export function App() {
                   Finanzas & Splitwise
                 </h1>
                 <span className="rounded-full bg-emerald-500/15 border border-emerald-500/30 px-2 py-0.5 text-[10px] font-bold text-emerald-300">
-                  finanzas.gonpa.com.ar
+                  {sessionUser.email}
                 </span>
               </div>
               <p className="text-[11px] text-slate-400">
-                Gestión Patrimonial 2014–2026 · Gastos Disc. · Crédito Hipotecario UVA · Splitwise Sync
+                Sesión autenticada RLS · Esquema aislado <code>finanzas</code>
               </p>
             </div>
           </div>
@@ -501,14 +813,19 @@ export function App() {
 
             <button
               onClick={() => setShowSupabaseModal(true)}
-              className={`inline-flex items-center gap-2 rounded-xl border px-3.5 py-1.5 text-xs font-semibold transition ${
-                cloudConnected
-                  ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20'
-                  : 'border-slate-700 bg-slate-900 text-slate-300 hover:bg-slate-800'
-              }`}
+              className="inline-flex items-center gap-2 rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-3.5 py-1.5 text-xs font-semibold text-emerald-300 hover:bg-emerald-500/20 transition"
             >
               <Cloud className="h-4 w-4" />
-              <span>Supabase (`finanzas`)</span>
+              <span>Sincronizar / Seed</span>
+            </button>
+
+            <button
+              onClick={handleSignOut}
+              title="Cerrar sesión y limpiar caché local"
+              className="inline-flex items-center gap-1.5 rounded-xl border border-slate-800 bg-slate-900 px-3 py-1.5 text-xs font-semibold text-rose-300 hover:bg-slate-800 transition"
+            >
+              <LogOut className="h-3.5 w-3.5" />
+              <span className="hidden md:inline">Salir</span>
             </button>
           </div>
         </div>
@@ -613,7 +930,7 @@ export function App() {
             Finanzas Personales & Splitwise · Dominio: <strong>finanzas.gonpa.com.ar</strong>
           </span>
           <span>
-            Esquema Supabase aislado: <code>finanzas.*</code> (RLS Activo · Sin impacto en <code>public</code> ni <code>impresion3d</code>)
+            Esquema Supabase aislado: <code>finanzas.*</code> (RLS Estricto · Cero acceso anónimo)
           </span>
         </div>
       </footer>
@@ -637,9 +954,10 @@ export function App() {
                 : prev.gruposSplitwise,
           }));
         }}
-        onResetToSeed={() => {
-          const fresh = resetDatabaseToExcelSeed();
-          setDb(fresh);
+        onSignOutPurge={() => {
+          setSessionUser(null);
+          setDb(clearLocalDatabaseCache());
+          setShowSupabaseModal(false);
         }}
       />
     </div>
